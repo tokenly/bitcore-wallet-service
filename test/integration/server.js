@@ -142,6 +142,105 @@ describe('Wallet service', function() {
     });
   });
 
+  describe('Session management (#login, #logout, #authenticate)', function() {
+    var server, wallet;
+    beforeEach(function(done) {
+      helpers.createAndJoinWallet(1, 2, function(s, w) {
+        server = s;
+        wallet = w;
+        done();
+      });
+    });
+
+    it('should get a new session & authenticate', function(done) {
+      WalletService.getInstanceWithAuth({
+        copayerId: server.copayerId,
+        session: 'dummy',
+      }, function(err, server2) {
+        should.exist(err);
+        err.code.should.equal('NOT_AUTHORIZED');
+        err.message.toLowerCase().should.contain('session');
+        should.not.exist(server2);
+        server.login({}, function(err, token) {
+          should.not.exist(err);
+          should.exist(token);
+          WalletService.getInstanceWithAuth({
+            copayerId: server.copayerId,
+            session: token,
+          }, function(err, server2) {
+            should.not.exist(err);
+            should.exist(server2);
+            server2.copayerId.should.equal(server.copayerId);
+            server2.walletId.should.equal(server.walletId);
+            done();
+          });
+        });
+      });
+    });
+    it('should get the same session token for two requests in a row', function(done) {
+      server.login({}, function(err, token) {
+        should.not.exist(err);
+        should.exist(token);
+        server.login({}, function(err, token2) {
+          should.not.exist(err);
+          token2.should.equal(token);
+          done();
+        });
+      });
+    });
+    it('should create a new session if the previous one has expired', function(done) {
+      var timer = sinon.useFakeTimers('Date');
+      var token;
+      async.series([
+
+        function(next) {
+          server.login({}, function(err, t) {
+            should.not.exist(err);
+            should.exist(t);
+            token = t;
+            next();
+          });
+        },
+        function(next) {
+          WalletService.getInstanceWithAuth({
+            copayerId: server.copayerId,
+            session: token,
+          }, function(err, server2) {
+            should.not.exist(err);
+            should.exist(server2);
+            next();
+          });
+        },
+        function(next) {
+          timer.tick((Defaults.SESSION_EXPIRATION + 1) * 1000);
+          next();
+        },
+        function(next) {
+          server.login({}, function(err, t) {
+            should.not.exist(err);
+            t.should.not.equal(token);
+            next();
+          });
+        },
+        function(next) {
+          WalletService.getInstanceWithAuth({
+            copayerId: server.copayerId,
+            session: token,
+          }, function(err, server2) {
+            should.exist(err);
+            err.code.should.equal('NOT_AUTHORIZED');
+            err.message.should.contain('expired');
+            next();
+          });
+        },
+      ], function(err) {
+        should.not.exist(err);
+        timer.restore();
+        done();
+      });
+    });
+  });
+
   describe('#createWallet', function() {
     var server;
     beforeEach(function() {
@@ -1043,9 +1142,10 @@ describe('Wallet service', function() {
 
       it('should create many addresses on simultaneous requests', function(done) {
         var N = 5;
-        async.map(_.range(N), function(i, cb) {
+        async.mapSeries(_.range(N), function(i, cb) {
           server.createAddress({}, cb);
         }, function(err, addresses) {
+          var x = _.pluck(addresses, 'path');
           addresses.length.should.equal(N);
           _.each(_.range(N), function(i) {
             addresses[i].path.should.equal('m/2147483647/0/' + i);
@@ -1090,7 +1190,7 @@ describe('Wallet service', function() {
 
       it('should create many addresses on simultaneous requests', function(done) {
         var N = 5;
-        async.map(_.range(N), function(i, cb) {
+        async.mapSeries(_.range(N), function(i, cb) {
           server.createAddress({}, cb);
         }, function(err, addresses) {
           addresses.length.should.equal(N);
@@ -2047,6 +2147,11 @@ describe('Wallet service', function() {
     before(function() {
       levels = Defaults.FEE_LEVELS;
       Defaults.FEE_LEVELS = [{
+        name: 'urgent',
+        nbBlocks: 1,
+        multiplier: 1.5,
+        defaultValue: 50000,
+      }, {
         name: 'priority',
         nbBlocks: 1,
         defaultValue: 50000
@@ -2087,6 +2192,9 @@ describe('Wallet service', function() {
         fees = _.zipObject(_.map(fees, function(item) {
           return [item.level, item];
         }));
+        fees.urgent.feePerKb.should.equal(60000);
+        fees.urgent.nbBlocks.should.equal(1);
+
         fees.priority.feePerKb.should.equal(40000);
         fees.priority.nbBlocks.should.equal(1);
 
@@ -4146,6 +4254,42 @@ describe('Wallet service', function() {
         });
       });
     });
+    it('should correctly handle change in tx history', function(done) {
+      server._normalizeTxHistory = sinon.stub().returnsArg(0);
+      helpers.stubUtxos(server, wallet, 2, function() {
+        var txs = [{
+          txid: '1',
+          confirmations: 1,
+          fees: 150,
+          time: Date.now() / 1000,
+          inputs: [{
+            address: firstAddress.address,
+            amount: 550,
+          }],
+          outputs: [{
+            address: firstAddress.address,
+            amount: 100,
+          }, {
+            address: 'external',
+            amount: 300,
+          }],
+        }];
+        helpers.stubHistory(txs);
+        server.getTxHistory({}, function(err, txs) {
+          should.not.exist(err);
+          should.exist(txs);
+          txs.length.should.equal(1);
+          var tx = txs[0];
+          tx.action.should.equal('sent');
+          tx.amount.should.equal(300);
+          tx.fees.should.equal(150);
+          tx.outputs.length.should.equal(1);
+          tx.outputs[0].address.should.equal('external');
+          tx.outputs[0].amount.should.equal(300);
+          done();
+        });
+      });
+    });
   });
 
 
@@ -5829,7 +5973,7 @@ describe('Wallet service', function() {
         txid: '1',
         confirmations: 1,
         fees: 100,
-        time: 1,
+        time: 12345,
         inputs: [{
           address: mainAddresses[0].address,
           amount: 500,
@@ -5848,7 +5992,7 @@ describe('Wallet service', function() {
         tx.action.should.equal('sent');
         tx.amount.should.equal(400);
         tx.fees.should.equal(100);
-        tx.time.should.equal(1);
+        tx.time.should.equal(12345);
         done();
       });
     });
@@ -5858,7 +6002,7 @@ describe('Wallet service', function() {
         txid: '1',
         confirmations: 1,
         fees: 100,
-        time: 1,
+        time: Date.now() / 1000,
         inputs: [{
           address: mainAddresses[0].address,
           amount: 500,
@@ -5925,7 +6069,7 @@ describe('Wallet service', function() {
                 txid: txp.txid,
                 confirmations: 1,
                 fees: 5460,
-                time: 1,
+                time: Date.now() / 1000,
                 inputs: [{
                   address: tx.inputs[0].address,
                   amount: utxos[0].satoshis,
@@ -6897,40 +7041,105 @@ describe('Wallet service', function() {
     });
 
     it('should subscribe copayer to push notifications service', function(done) {
-      request.yields();
       helpers.getAuthServer(wallet.copayers[0].id, function(server) {
         should.exist(server);
         server.pushNotificationsSubscribe({
-          token: 'DEVICE_TOKEN'
-        }, function(err, response) {
+          token: 'DEVICE_TOKEN',
+          packageName: 'com.wallet',
+          platform: 'Android',
+        }, function(err) {
           should.not.exist(err);
-          var calls = request.getCalls();
-          calls.length.should.equal(1);
-          var args = _.map(calls, function(c) {
-            return c.args[0];
+          server.storage.fetchPushNotificationSubs(wallet.copayers[0].id, function(err, subs) {
+            should.not.exist(err);
+            should.exist(subs);
+            subs.length.should.equal(1);
+            var s = subs[0];
+            s.token.should.equal('DEVICE_TOKEN');
+            s.packageName.should.equal('com.wallet');
+            s.platform.should.equal('Android')
+            done();
           });
-          args[0].body.user.should.contain(wallet.copayers[0].id);
-          args[0].body.user.should.contain(wallet.id);
-          args[0].body.token.should.contain('DEVICE_TOKEN');
-          done();
+        });
+      });
+    });
+    it('should allow multiple subscriptions for the same copayer', function(done) {
+      helpers.getAuthServer(wallet.copayers[0].id, function(server) {
+        should.exist(server);
+        server.pushNotificationsSubscribe({
+          token: 'DEVICE_TOKEN',
+          packageName: 'com.wallet',
+          platform: 'Android',
+        }, function(err) {
+          server.pushNotificationsSubscribe({
+            token: 'DEVICE_TOKEN2',
+            packageName: 'com.my-other-wallet',
+            platform: 'iOS',
+          }, function(err) {
+            should.not.exist(err);
+            server.storage.fetchPushNotificationSubs(wallet.copayers[0].id, function(err, subs) {
+              should.not.exist(err);
+              should.exist(subs);
+              subs.length.should.equal(2);
+              done();
+            });
+          });
         });
       });
     });
 
     it('should unsubscribe copayer to push notifications service', function(done) {
-      request.yields();
       helpers.getAuthServer(wallet.copayers[0].id, function(server) {
         should.exist(server);
-        server.pushNotificationsUnsubscribe(function(err, response) {
-          should.not.exist(err);
-          var calls = request.getCalls();
-          calls.length.should.equal(1);
-          var args = _.map(calls, function(c) {
-            return c.args[0];
-          });
+        async.series([
 
-          args[0].body.user.should.contain(wallet.copayers[0].id);
-          args[0].body.user.should.contain(wallet.id);
+          function(next) {
+            server.pushNotificationsSubscribe({
+              token: 'DEVICE_TOKEN',
+              packageName: 'com.wallet',
+              platform: 'Android',
+            }, next);
+          },
+          function(next) {
+            server.pushNotificationsSubscribe({
+              token: 'DEVICE_TOKEN2',
+              packageName: 'com.my-other-wallet',
+              platform: 'iOS',
+            }, next);
+          },
+          function(next) {
+            server.pushNotificationsUnsubscribe({
+              token: 'DEVICE_TOKEN2'
+            }, next);
+          },
+          function(next) {
+            server.storage.fetchPushNotificationSubs(wallet.copayers[0].id, function(err, subs) {
+              should.not.exist(err);
+              should.exist(subs);
+              subs.length.should.equal(1);
+              var s = subs[0];
+              s.token.should.equal('DEVICE_TOKEN');
+              next();
+            });
+          },
+          function(next) {
+            helpers.getAuthServer(wallet.copayers[1].id, function(server) {
+              server.pushNotificationsUnsubscribe({
+                token: 'DEVICE_TOKEN'
+              }, next);
+            });
+          },
+          function(next) {
+            server.storage.fetchPushNotificationSubs(wallet.copayers[0].id, function(err, subs) {
+              should.not.exist(err);
+              should.exist(subs);
+              subs.length.should.equal(1);
+              var s = subs[0];
+              s.token.should.equal('DEVICE_TOKEN');
+              next();
+            });
+          },
+        ], function(err) {
+          should.not.exist(err);
           done();
         });
       });
